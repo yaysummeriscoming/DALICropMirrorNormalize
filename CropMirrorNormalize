@@ -1,0 +1,257 @@
+import argparse
+import os
+import shutil
+import time
+
+import torch
+from torch.autograd import Variable
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.optim
+import torch.utils.data
+import torch.utils.data.distributed
+import torchvision.models as models
+
+import importlib
+
+try:
+    from nvidia.dali.plugin.pytorch import DALIClassificationIterator
+    from nvidia.dali.pipeline import Pipeline
+    import nvidia.dali.ops as ops
+    import nvidia.dali.types as types
+except ImportError:
+    raise ImportError("Please install DALI from https://www.github.com/NVIDIA/DALI to run this example.")
+
+
+# item() is a recent addition, so this helps with backward compatibility.
+def to_python_float(t):
+    if hasattr(t, 'item'):
+        return t.item()
+    else:
+        return t[0]
+
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
+
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+
+def reduce_tensor(tensor):
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.reduce_op.SUM)
+    rt /= args.world_size
+    return rt
+
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+def validate(val_loader, model, criterion):
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
+
+    end = time.time()
+
+    for i, data in enumerate(val_loader):
+        input = data[0]["data"]
+        target = data[0]["label"].squeeze().cuda().long()
+        val_loader_len = int(val_loader._size / args.batch_size)
+
+        target = target.cuda(async=True)
+        input_var = Variable(input)
+        target_var = Variable(target)
+
+        # compute output
+        with torch.no_grad():
+            output = model(input_var)
+            loss = criterion(output, target_var)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+
+        if args.distributed:
+            reduced_loss = reduce_tensor(loss.data)
+            prec1 = reduce_tensor(prec1)
+            prec5 = reduce_tensor(prec5)
+        else:
+            reduced_loss = loss.data
+
+        losses.update(to_python_float(reduced_loss), input.size(0))
+        top1.update(to_python_float(prec1), input.size(0))
+        top5.update(to_python_float(prec5), input.size(0))
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if args.local_rank == 0 and i % args.print_freq == 0:
+            print('Test: [{0}/{1}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Speed {2:.3f} ({3:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                   i, val_loader_len,
+                   args.world_size * args.batch_size / batch_time.val,
+                   args.world_size * args.batch_size / batch_time.avg,
+                   batch_time=batch_time, loss=losses,
+                   top1=top1, top5=top5))
+
+    print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
+          .format(top1=top1, top5=top5))
+
+    return [top1.avg, top5.avg]
+
+
+class HybridValPipe_GPU(Pipeline):
+    def __init__(self, batch_size, num_threads, device_id, data_dir, crop, size):
+        super(HybridValPipe_GPU, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
+        self.input = ops.FileReader(file_root=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=False)
+        self.decode = ops.nvJPEGDecoder(device="mixed", output_type=types.RGB)
+        self.res = ops.Resize(device="gpu", resize_shorter=size)
+        self.cmnp = ops.CropMirrorNormalize(device="gpu",
+                                            output_dtype=types.FLOAT,
+                                            output_layout=types.NCHW,
+                                            crop=(crop, crop),
+                                            image_type=types.RGB,
+                                            mean=[0.485 * 255,0.456 * 255,0.406 * 255],
+                                            std=[0.229 * 255,0.224 * 255,0.225 * 255])
+
+    def define_graph(self):
+        self.jpegs, self.labels = self.input(name="Reader")
+        images = self.decode(self.jpegs)
+        images = self.res(images)
+        output = self.cmnp(images)
+        return [output, self.labels]
+
+
+class HybridValPipe_hybrid_CPU(Pipeline):
+    def __init__(self, batch_size, num_threads, device_id, data_dir, crop, size):
+        super(HybridValPipe_hybrid_CPU, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
+        self.input = ops.FileReader(file_root=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=False)
+        self.decode = ops.HostDecoder(device="cpu", output_type=types.RGB)
+        self.res = ops.Resize(device="cpu", resize_shorter=size)
+        self.cmnp = ops.CropMirrorNormalize(device="gpu",
+                                            output_dtype=types.FLOAT,
+                                            output_layout=types.NCHW,
+                                            crop=(crop, crop),
+                                            image_type=types.RGB,
+                                            mean=[0.485 * 255,0.456 * 255,0.406 * 255],
+                                            std=[0.229 * 255,0.224 * 255,0.225 * 255])
+
+    def define_graph(self):
+        self.jpegs, self.labels = self.input(name="Reader")
+        images = self.decode(self.jpegs)
+        images = self.res(images)
+        output = self.cmnp(images.gpu())
+        return [output, self.labels]
+
+
+class HybridValPipe_CPU(Pipeline):
+    def __init__(self, batch_size, num_threads, device_id, data_dir, crop, size):
+        super(HybridValPipe_CPU, self).__init__(batch_size, num_threads, device_id, seed=12 + device_id)
+        self.input = ops.FileReader(file_root=data_dir, shard_id=args.local_rank, num_shards=args.world_size, random_shuffle=False)
+        self.decode = ops.HostDecoder(device="cpu", output_type=types.RGB)
+        self.res = ops.Resize(device="cpu", resize_shorter=size)
+
+        # Use CPU mode for CropMirrorNormalize op.  This seems to impact accuracy
+        self.cmnp = ops.CropMirrorNormalize(device="cpu",
+                                            output_dtype=types.FLOAT,
+                                            output_layout=types.NCHW,
+                                            crop=(crop, crop),
+                                            image_type=types.RGB,
+                                            mean=[0.485 * 255,0.456 * 255,0.406 * 255],
+                                            std=[0.229 * 255,0.224 * 255,0.225 * 255])
+
+    def define_graph(self):
+        self.jpegs, self.labels = self.input(name="Reader")
+        images = self.decode(self.jpegs)
+        images = self.res(images)
+        output = self.cmnp(images)
+        return [output.gpu(), self.labels]
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+    parser.add_argument('data', metavar='DIR', nargs='*',
+                        help='path(s) to dataset (if one path is provided, it is assumed\n' +
+                        'to have subdirectories named "train" and "val"; alternatively,\n' +
+                        'train and val paths can be specified directly by providing both paths as arguments)')
+    parser.add_argument('-b', '--batch-size', default=500, type=int,
+                        metavar='N', help='mini-batch size (default: 256)')
+    args = parser.parse_args()
+    args.local_rank = 0
+    args.world_size = 1
+    args.distributed = False
+    args.print_freq = 10
+
+    # Data loading code
+    if len(args.data) == 1:
+        traindir = os.path.join(args.data[0], 'train')
+        valdir = os.path.join(args.data[0], 'val')
+    else:
+        traindir = args.data[0]
+        valdir = args.data[1]
+
+    cudnn.benchmark = True
+
+    model = models.resnet18(pretrained=True).cuda()
+    criterion = nn.CrossEntropyLoss().cuda()
+
+    # GPU
+    pipe = HybridValPipe_GPU(batch_size=args.batch_size, num_threads=4, device_id=0, data_dir=valdir, crop=224, size=256)
+    pipe.build()
+    val_loader = DALIClassificationIterator(pipe, size=int(pipe.epoch_size("Reader")))
+    top1_gpu, top5_gpu = validate(val_loader, model, criterion)
+
+    del pipe, val_loader
+
+    # Hybrid CPU
+    pipe = HybridValPipe_hybrid_CPU(batch_size=args.batch_size, num_threads=4, device_id=0, data_dir=valdir, crop=224, size=256)
+    pipe.build()
+    val_loader = DALIClassificationIterator(pipe, size=int(pipe.epoch_size("Reader")))
+    top1_hybrid_cpu, top5_hybrid_cpu = validate(val_loader, model, criterion)
+
+    del pipe, val_loader
+
+    # Full CPU
+    pipe = HybridValPipe_CPU(batch_size=args.batch_size, num_threads=4, device_id=0, data_dir=valdir, crop=224, size=256)
+    pipe.build()
+    val_loader = DALIClassificationIterator(pipe, size=int(pipe.epoch_size("Reader")))
+    top1_cpu, top5_cpu = validate(val_loader, model, criterion)
+
+    print('Top1: GPU: %0.2f, hybrid CPU: %0.2f, CPU: %0.2f' % (top1_gpu, top1_hybrid_cpu, top1_cpu))
+    print('Top5: GPU: %0.2f, hybrid CPU: %0.2f, CPU: %0.2f' % (top5_gpu, top5_hybrid_cpu, top5_cpu))
